@@ -78,6 +78,8 @@ def print_help() -> None:
         ("/sessions new <标题>", "创建新会话"),
         ("/sessions switch <id>", "切换到指定会话"),
         ("/sessions search <关键词>", "搜索会话内容"),
+        ("/config", "查看当前配置"),
+        ("/config edit", "在编辑器中修改配置"),
         ("/demo", "运行交互演示（Echo 模式，无 LLM）"),
     ]
 
@@ -510,6 +512,61 @@ def _cmd_sessions(args: list[str]) -> None:
         console.print("/sessions [new|title|switch <id>|delete <id>|rename <id> <title>|search <text>]")
 
 
+# ---------------------------------------------------------------------------
+# Config commands
+# ---------------------------------------------------------------------------
+
+import os
+import subprocess
+from pathlib import Path
+
+
+def _cmd_config(args: list[str]) -> None:
+    """Handle /config and /config edit commands."""
+    global _config
+
+    if not args or args[0] == "show":
+        # Show current config
+        config_path = str(Path.home() / ".lustre" / "config.yaml")
+
+        console.print("\n[bold]当前配置[/bold]")
+        console.print(f"  配置文件: [dim]{config_path}[/dim]")
+
+        if _config:
+            code_cfg = _config.agents.get("code", {})
+            console.print(f"  模型: {code_cfg.get('model_name', '未配置')}")
+            console.print(f"  Agents: {list(_config.agents.keys())}")
+
+            from lustre.tools import get_tool_registry
+            reg = get_tool_registry()
+            enabled = [t.name for t in reg.enabled_tools()]
+            console.print(f"  启用工具: {', '.join(enabled)}")
+        else:
+            console.print("  [dim]未加载配置[/dim]")
+
+        console.print(f"\n  输入 [cyan]/config edit[/cyan] 在编辑器中修改")
+        return
+
+    if args[0] == "edit":
+        config_path = Path.home() / ".lustre" / "config.yaml"
+        if not config_path.exists():
+            console.print(f"[yellow]配置文件不存在: {config_path}[/yellow]")
+            return
+        editor = os.environ.get("EDITOR", "vi")
+        console.print(f"[dim]Opening {config_path} with {editor}...[/dim]")
+        try:
+            subprocess.run([editor, str(config_path)], check=True)
+        except subprocess.CalledProcessError:
+            pass
+        except FileNotFoundError:
+            console.print(f"[red]$EDITOR ({editor}) not found. Set EDITOR env var.[/red]")
+            console.print(f"  Config: {config_path}")
+        return
+
+    console.print(f"[red]未知 /config 子命令: {args[0]}[/red]")
+    console.print("/config [show]|edit]")
+
+
 def _reload_code_agent() -> None:
     """Stop current CodeAgent and restart with current skills."""
     global _supervisor
@@ -676,6 +733,9 @@ def main() -> None:
         elif cmd.startswith("/sessions"):
             parts = cmd.split()
             _cmd_sessions(parts[1:])
+
+        elif cmd == "/config" or cmd.startswith("/config "):
+            _cmd_config(cmd.split()[1:])
 
         elif cmd == "/status":
             _print_status()
