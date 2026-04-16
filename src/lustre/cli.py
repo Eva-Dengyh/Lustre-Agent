@@ -1,6 +1,6 @@
 """Lustre Agent CLI — Interactive shell for multi-agent coordination.
 
-Phase 4: integrates real LLM-powered CodeAgent via config.
+Phase 5: integrates Skill system.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from lustre.agents.base import AgentConfig, SpecialistAgent
 from lustre.agents.code_agent import CodeAgent
 from lustre.bus.memory_bus import MemoryMessageBus
 from lustre.config.loader import load_config
+from lustre.skills import SkillManager
+from lustre.skills.models import SkillInstance
 from lustre.supervisor import (
     ExecutionPlan,
     Supervisor,
@@ -32,6 +34,7 @@ console = Console()
 _bus: MemoryMessageBus | None = None
 _supervisor: Supervisor | None = None
 _config = None
+_skill_manager: SkillManager | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +42,7 @@ _config = None
 # ---------------------------------------------------------------------------
 
 def print_banner() -> None:
-    v = _config.version if _config else "0.4.0"
+    v = _config.version if _config else "0.5.0"
     banner = Text()
     banner.append("Lustre Agent", style="bold gold1")
     banner.append(f"  v{v}", style="dim")
@@ -66,9 +69,10 @@ def print_help() -> None:
         ("/abort", "取消当前任务"),
         ("/retry", "重试失败的上一步"),
         ("/skip", "跳过当前步骤"),
-        ("/edit", "修改计划或任务描述"),
+        ("/skills", "查看已加载的 Skills"),
+        ("/skills load <name>", "加载指定 Skill"),
+        ("/skills unload <name>", "卸载指定 Skill"),
         ("/demo", "运行交互演示（Echo 模式，无 LLM）"),
-        ("/llm", "切换到 LLM 模式 CodeAgent"),
     ]
 
     for cmd, desc in commands:
@@ -78,12 +82,35 @@ def print_help() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Agent factory
+# SkillManager setup
+# ---------------------------------------------------------------------------
+
+def _setup_skills() -> SkillManager:
+    global _skill_manager
+    if _skill_manager is None:
+        _skill_manager = SkillManager()
+        _skill_manager.discover()
+        _skill_manager.load_all()
+        _print_skills_banner()
+    return _skill_manager
+
+
+def _print_skills_banner() -> None:
+    if not _skill_manager:
+        return
+    names = _skill_manager.list_skill_names()
+    if names:
+        console.print(f"[dim]已加载 {len(names)} 个 Skills: {', '.join(names)}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Agent factory (with Skill injection)
 # ---------------------------------------------------------------------------
 
 def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
     """Create specialist agents, using LLM CodeAgent if API key is available."""
     cfg = _config
+    sm = _skill_manager
     agents: dict[str, SpecialistAgent] = {}
 
     # CodeAgent — use real LLM if ANTHROPIC_API_KEY is set
@@ -96,7 +123,11 @@ def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
             model_name=code_cfg.get("model_name", "claude-sonnet-4-6"),
             api_key=api_key,
         )
-        code_agent = CodeAgent(config=agent_cfg, bus=bus)
+        # Inject matched skills
+        skills: list[SkillInstance] = []
+        if sm:
+            skills = sm.get_loaded()
+        code_agent = CodeAgent(config=agent_cfg, bus=bus, skills=skills)
         code_agent.start()
         agents["code"] = code_agent
         console.print(f"[dim]CodeAgent (LLM): {agent_cfg.model_name}[/dim]")
@@ -108,14 +139,13 @@ def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
         agents["code"] = echo_agent
         console.print("[dim]CodeAgent (Echo 模式)[/dim]")
 
-    # ResearchEchoAgent
+    # Echo agents for research/test
     from lustre.agents.echo_agent import EchoAgent
     research_cfg = AgentConfig(name="research", description="Research agent")
     research_impl = EchoAgent(config=research_cfg, bus=bus)
     research_impl.start()
     agents["research"] = research_impl
 
-    # TestEchoAgent
     test_cfg = AgentConfig(name="test", description="Test agent")
     test_impl = EchoAgent(config=test_cfg, bus=bus)
     test_impl.start()
@@ -286,40 +316,166 @@ def _print_status() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Demo (Echo mode — no real LLM)
+# Skills commands
+# ---------------------------------------------------------------------------
+
+def _cmd_skills(args: list[str]) -> None:
+    """Handle /skills command and its subcommands."""
+    if not _skill_manager:
+        _setup_skills()
+
+    if not args:
+        # List all loaded skills
+        loaded = _skill_manager.get_loaded()
+        discovered = _skill_manager.list_skill_names()
+
+        console.print("\n[bold]Skills 状态[/bold]")
+        console.print(f"已发现: [cyan]{len(discovered)}[/cyan] 个")
+        console.print(f"已加载: [green]{len(loaded)}[/green] 个")
+
+        if loaded:
+            table = Table(title="已加载的 Skills", show_header=True)
+            table.add_column("名称", style="cyan")
+            table.add_column("描述", style="white")
+            table.add_column("触发词", style="dim")
+            table.add_column("版本", style="dim", width=8)
+
+            for si in loaded:
+                s = si.skill
+                table.add_row(
+                    s.name,
+                    s.description[:50],
+                    ", ".join(s.trigger_keywords[:3]),
+                    s.version,
+                )
+            console.print(table)
+        else:
+            console.print("[dim]无已加载 Skills[/dim]")
+        return
+
+    subcmd = args[0]
+
+    if subcmd == "load":
+        if len(args) < 2:
+            console.print("[red]用法: /skills load <skill_name>[/red]")
+            return
+        name = args[1]
+        instance = _skill_manager.load_skill(name)
+        if instance:
+            console.print(f"[green]✓[/green] 已加载 Skill: {name}")
+            # Reload CodeAgent with new skills
+            _reload_code_agent()
+        else:
+            console.print(f"[red]✗[/red] 未找到 Skill: {name}")
+            console.print(f"  可用: {', '.join(_skill_manager.list_skill_names())}")
+
+    elif subcmd == "unload":
+        if len(args) < 2:
+            console.print("[red]用法: /skills unload <skill_name>[/red]")
+            return
+        name = args[1]
+        _skill_manager.unload_skill(name)
+        console.print(f"[green]✓[/green] 已卸载 Skill: {name}")
+        _reload_code_agent()
+
+    elif subcmd == "list":
+        discovered = _skill_manager.list_skill_names()
+        console.print("\n[bold]所有已发现的 Skills[/bold]")
+        if not discovered:
+            console.print("[dim]无[/dim]")
+        for name in discovered:
+            s = _skill_manager.get_skill(name)
+            loaded_tag = "[green]●[/green]" if _skill_manager.is_loaded(name) else "[dim]○[/dim]"
+            console.print(f"  {loaded_tag} {name}: {s.description if s else ''}")
+        console.print(f"\n共 {len(discovered)} 个 Skill")
+
+    elif subcmd == "match":
+        # Show which skills would match a given task description
+        if len(args) < 2:
+            console.print("[red]用法: /skills match <task_description>[/red]")
+            return
+        task_desc = " ".join(args[1:])
+        matched = _skill_manager.match_skills(task_desc)
+        console.print(f"\n[bold]匹配结果[/bold] — {len(matched)} 个 Skill 匹配")
+        for si in matched:
+            console.print(f"  [green]✓[/green] {si.name}")
+            console.print(f"       {si.skill.description}")
+        if not matched:
+            console.print("[dim]无匹配[/dim]")
+
+    else:
+        console.print(f"[red]未知子命令: {subcmd}[/red]")
+        console.print("/skills [load <name>|unload <name>|list|match <text>]")
+
+
+def _reload_code_agent() -> None:
+    """Stop current CodeAgent and restart with current skills."""
+    global _supervisor
+    if _supervisor is None:
+        return
+    # Replace code agent
+    code_agent = _supervisor.agents.get("code")
+    if code_agent:
+        code_agent.stop()
+    # Reload from factory with current skills
+    if _skill_manager and _skill_manager.get_loaded():
+        new_code = _create_code_agent_with_skills()
+        if new_code:
+            _supervisor.agents["code"] = new_code
+            console.print("[dim]CodeAgent 已更新（包含当前 Skills）[/dim]")
+
+
+def _create_code_agent_with_skills() -> SpecialistAgent | None:
+    """Create a new CodeAgent with the current skill set."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key or not _config:
+        return None
+    code_cfg = _config.agents.get("code", {})
+    agent_cfg = AgentConfig(
+        name="code",
+        model_provider=code_cfg.get("model_provider", "anthropic"),
+        model_name=code_cfg.get("model_name", "claude-sonnet-4-6"),
+        api_key=api_key,
+    )
+    skills = _skill_manager.get_loaded() if _skill_manager else []
+    code_agent = CodeAgent(config=agent_cfg, bus=_bus, skills=skills)
+    code_agent.start()
+    return code_agent
+
+
+# ---------------------------------------------------------------------------
+# Demo (Echo mode)
 # ---------------------------------------------------------------------------
 
 def run_demo() -> None:
     """Run an interactive demonstration using EchoAgents (no LLM needed)."""
     global _supervisor
 
-    console.print("\n[bold]=== Phase 3 交互演示 (Echo 模式) ===[/bold]\n")
+    console.print("\n[bold]=== Phase 5 交互演示 (Echo 模式) ===[/bold]\n")
+    console.print("[dim]Skills: python-expert, fastapi-expert 已加载[/dim]\n")
 
-    # Use echo agents for demo
-    _bus = MemoryMessageBus()
+    _demo_bus = MemoryMessageBus()
 
     from lustre.agents.echo_agent import CodeEchoAgent, EchoAgent
     from lustre.agents.base import AgentConfig
 
     echo_agents: dict[str, SpecialistAgent] = {}
 
-    # CodeEchoAgent creates its own config internally
-    code_echo = CodeEchoAgent(bus=_bus)
+    code_echo = CodeEchoAgent(bus=_demo_bus)
     code_echo.start()
     echo_agents["code"] = code_echo
 
-    # EchoAgent needs explicit config
     research_cfg = AgentConfig(name="research", description="Research echo agent")
-    research_impl = EchoAgent(config=research_cfg, bus=_bus)
+    research_impl = EchoAgent(config=research_cfg, bus=_demo_bus)
     research_impl.start()
     echo_agents["research"] = research_impl
 
     test_cfg = AgentConfig(name="test", description="Test echo agent")
-    test_impl = EchoAgent(config=test_cfg, bus=_bus)
+    test_impl = EchoAgent(config=test_cfg, bus=_demo_bus)
     test_impl.start()
     echo_agents["test"] = test_impl
 
-    sup = Supervisor(bus=_bus, agents=echo_agents)
+    sup = Supervisor(bus=_demo_bus, agents=echo_agents)
 
     def on_confirmation(plan: ExecutionPlan) -> None:
         _print_plan_confirmation(plan)
@@ -373,6 +529,9 @@ def main() -> None:
     print_banner()
     console.print("[dim]输入 /help 查看命令[/dim]\n")
 
+    # Setup skills first (so CodeAgent can use them)
+    _setup_skills()
+
     # Initialise bus and supervisor
     _bus = MemoryMessageBus()
     _supervisor = _setup_supervisor()
@@ -402,6 +561,10 @@ def main() -> None:
         elif cmd == "/demo":
             run_demo()
 
+        elif cmd.startswith("/skills"):
+            parts = cmd.split()
+            _cmd_skills(parts[1:])
+
         elif cmd == "/status":
             _print_status()
 
@@ -429,19 +592,7 @@ def main() -> None:
                 _supervisor.skip_current_step()
 
         elif cmd == "/edit":
-            console.print("[dim]功能开发中 (Phase 5+)[/dim]")
-
-        elif cmd == "/llm":
-            # Reload with LLM agents
-            _teardown_supervisor()
-            if _config is None:
-                try:
-                    _config = load_config()
-                except FileNotFoundError:
-                    console.print("[red]无法加载配置[/red]")
-            _bus = MemoryMessageBus()
-            _supervisor = _setup_supervisor()
-            console.print("[green]已切换到 LLM 模式[/green]")
+            console.print("[dim]功能开发中 (Phase 6+)[/dim]")
 
         elif not cmd.startswith("/"):
             if _supervisor and _supervisor.state == SupervisorState.IDLE:
