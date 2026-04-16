@@ -22,6 +22,7 @@ from lustre.agents.base import AgentConfig, SpecialistAgent
 from lustre.agents.code_agent import CodeAgent
 from lustre.bus.memory_bus import MemoryMessageBus
 from lustre.config.loader import load_config
+from lustre.session import SessionManager
 from lustre.skills import SkillManager
 from lustre.skills.models import SkillInstance
 from lustre.supervisor import (
@@ -35,6 +36,7 @@ _bus: MemoryMessageBus | None = None
 _supervisor: Supervisor | None = None
 _config = None
 _skill_manager: SkillManager | None = None
+_session_manager: SessionManager | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +74,10 @@ def print_help() -> None:
         ("/skills", "查看已加载的 Skills"),
         ("/skills load <name>", "加载指定 Skill"),
         ("/skills unload <name>", "卸载指定 Skill"),
+        ("/sessions", "查看所有会话"),
+        ("/sessions new <标题>", "创建新会话"),
+        ("/sessions switch <id>", "切换到指定会话"),
+        ("/sessions search <关键词>", "搜索会话内容"),
         ("/demo", "运行交互演示（Echo 模式，无 LLM）"),
     ]
 
@@ -408,6 +414,102 @@ def _cmd_skills(args: list[str]) -> None:
         console.print("/skills [load <name>|unload <name>|list|match <text>]")
 
 
+# ---------------------------------------------------------------------------
+# Sessions commands
+# ---------------------------------------------------------------------------
+
+def _cmd_sessions(args: list[str]) -> None:
+    """Handle /sessions command and its subcommands."""
+    global _session_manager
+    if _session_manager is None:
+        console.print("[dim]Session 系统未初始化[/dim]")
+        return
+
+    if not args:
+        # List all sessions
+        sessions = _session_manager.list_sessions(limit=20)
+        console.print("\n[bold]会话列表[/bold]")
+        if not sessions:
+            console.print("[dim]无会话记录[/dim]")
+            return
+
+        active_id = _session_manager.active_session_id
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("", width=1)
+        table.add_column("ID", style="dim", width=10)
+        table.add_column("标题", style="white")
+        table.add_column("消息数", style="cyan", width=8)
+        table.add_column("最后更新", style="dim")
+
+        for s in sessions:
+            tag = "[green]●[/green]" if s.id == active_id else " "
+            from lustre.session import SessionStore
+            store = SessionStore()
+            msg_count = store.count_messages(s.id)
+            updated = s.updated_at[:16] if s.updated_at else ""
+            table.add_row(tag, s.id[:8], s.title, str(msg_count), updated)
+
+        console.print(table)
+        return
+
+    subcmd = args[0]
+
+    if subcmd == "new":
+        title = " ".join(args[1:]) if len(args) > 1 else "新会话"
+        s = _session_manager.create_session(title=title)
+        console.print(f"[green]✓[/green] 创建会话: {s.title} (ID: {s.id[:8]})")
+
+    elif subcmd == "switch":
+        if len(args) < 2:
+            console.print("[red]用法: /sessions switch <id>[/red]")
+            return
+        sid = args[1]
+        s = _session_manager.switch_session(sid)
+        if s:
+            console.print(f"[green]✓[/green] 切换到: {s.title}")
+        else:
+            console.print(f"[red]未找到会话: {sid}[/red]")
+
+    elif subcmd == "delete":
+        if len(args) < 2:
+            console.print("[red]用法: /sessions delete <id>[/red]")
+            return
+        sid = args[1]
+        if _session_manager.delete_session(sid):
+            console.print(f"[green]✓[/green] 已删除: {sid[:8]}")
+        else:
+            console.print(f"[red]未找到会话: {sid}[/red]")
+
+    elif subcmd == "rename":
+        if len(args) < 3:
+            console.print("[red]用法: /sessions rename <id> <新标题>[/red]")
+            return
+        sid = args[1]
+        new_title = " ".join(args[2:])
+        if _session_manager.rename_session(sid, new_title):
+            console.print(f"[green]✓[/green] 已重命名: {new_title}")
+        else:
+            console.print(f"[red]未找到会话: {sid}[/red]")
+
+    elif subcmd == "search":
+        if len(args) < 2:
+            console.print("[red]用法: /sessions search <关键词>[/red]")
+            return
+        query = " ".join(args[1:])
+        results = _session_manager.search(query, limit=10)
+        console.print(f"\n[bold]搜索结果: {query!r}[/bold]")
+        if not results:
+            console.print("[dim]无结果[/dim]")
+        for r in results:
+            role_tag = f"[{r['role']}]"
+            content = r["content"][:100]
+            console.print(f"  {role_tag} {content}")
+
+    else:
+        console.print(f"[red]未知子命令: {subcmd}[/red]")
+        console.print("/sessions [new|title|switch <id>|delete <id>|rename <id> <title>|search <text>]")
+
+
 def _reload_code_agent() -> None:
     """Stop current CodeAgent and restart with current skills."""
     global _supervisor
@@ -451,7 +553,7 @@ def run_demo() -> None:
     """Run an interactive demonstration using EchoAgents (no LLM needed)."""
     global _supervisor
 
-    console.print("\n[bold]=== Phase 5 交互演示 (Echo 模式) ===[/bold]\n")
+    console.print("\n[bold]=== Phase 7 交互演示 (Echo 模式) ===[/bold]\n")
     console.print("[dim]Skills: python-expert, fastapi-expert 已加载[/dim]\n")
 
     _demo_bus = MemoryMessageBus()
@@ -532,6 +634,12 @@ def main() -> None:
     # Setup skills first (so CodeAgent can use them)
     _setup_skills()
 
+    # Initialise session manager
+    global _session_manager
+    _session_manager = SessionManager()
+    _session_manager.create_session(title="默认会话")
+    console.print("[green]✓[/green] Session 系统就绪\n")
+
     # Initialise bus and supervisor
     _bus = MemoryMessageBus()
     _supervisor = _setup_supervisor()
@@ -564,6 +672,10 @@ def main() -> None:
         elif cmd.startswith("/skills"):
             parts = cmd.split()
             _cmd_skills(parts[1:])
+
+        elif cmd.startswith("/sessions"):
+            parts = cmd.split()
+            _cmd_sessions(parts[1:])
 
         elif cmd == "/status":
             _print_status()
