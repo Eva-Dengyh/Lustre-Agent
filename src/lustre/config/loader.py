@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-__all__ = ["load_config", "Config"]
+__all__ = ["load_config", "Config", "has_config"]
 
 
 # Pattern: ${VAR} or ${VAR:default}
@@ -140,6 +140,26 @@ class Config:
 # ---------------------------------------------------------------------------
 
 _config: Config | None = None
+
+
+def has_config() -> bool:
+    """Return True if a config file exists in any of the standard locations.
+
+    Checks in order:
+    1. LUSTRE_CONFIG environment variable
+    2. ./configs/config.yaml (CWD)
+    3. ~/.lustre/config.yaml
+    """
+    if os.environ.get("LUSTRE_CONFIG"):
+        return Path(os.environ["LUSTRE_CONFIG"]).exists()
+
+    if Path("configs/config.yaml").exists():
+        return True
+
+    if (Path.home() / ".lustre" / "config.yaml").exists():
+        return True
+
+    return False
 
 
 def load_config() -> Config:

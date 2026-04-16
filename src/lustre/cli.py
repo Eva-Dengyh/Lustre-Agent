@@ -672,18 +672,50 @@ def run_demo() -> None:
 
 
 # ---------------------------------------------------------------------------
+# First-run detection and setup wizard
+# ---------------------------------------------------------------------------
+
+def _has_config_guarded() -> bool:
+    """Check if config exists, with import safety."""
+    try:
+        from lustre.config.loader import has_config
+        return has_config()
+    except Exception:
+        return False
+
+
+def _run_setup_wizard() -> None:
+    """Launch the interactive first-run wizard."""
+    try:
+        from lustre.config.wizard import run_wizard
+        run_wizard()
+    except Exception as exc:
+        console.print(f"[red]向导出错: {exc}[/red]")
+        console.print("[dim]可直接运行 [cyan]lustre init[/cyan] 或编辑 ~/.lustre/config.yaml[/dim]")
+
+
+# ---------------------------------------------------------------------------
 # Main REPL
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     global _supervisor, _config
 
-    # Load config first
-    try:
-        _config = load_config()
-    except FileNotFoundError:
-        console.print("[yellow]警告: 未找到配置文件，使用默认配置[/yellow]")
-        _config = None
+    # First-run detection: no config file → run setup wizard
+    if not _has_config_guarded():
+        _run_setup_wizard()
+        # After wizard, config should exist (user might have cancelled → empty cfg)
+        try:
+            _config = load_config()
+        except FileNotFoundError:
+            _config = None
+
+    else:
+        try:
+            _config = load_config()
+        except FileNotFoundError:
+            console.print("[yellow]警告: 未找到配置文件，使用默认配置[/yellow]")
+            _config = None
 
     print_banner()
     console.print("[dim]输入 /help 查看命令[/dim]\n")
