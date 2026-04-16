@@ -37,18 +37,27 @@ Lustre Agent 是一个纯 Python 构建的多 Agent 编程助手，采用 Superv
 你: "帮我调研 FastAPI 和 Flask，然后写一个 hello world API"
 
         ↓
-[Supervisor] 分析需求，拆解步骤：调研 → 代码 → 测试
+[Supervisor] 分析需求，给出计划
 
         ↓
-⚠️ 确认计划：research → code → test
-(/go 继续 /edit 修改 /abort 取消)
+⚠️ 确认计划
+  任务拆解：调研技术方案 → 编写代码 → 运行测试
+  Agent 安排：
+    调研 Agent → 分析 FastAPI vs Flask
+    代码 Agent  → 编写 hello world API
+    测试 Agent  → 验证代码正确性
+
+  (/go 继续 /edit 修改 /abort 取消)
 
         ↓
 [调研 Agent] 搜索对比 FastAPI vs Flask，给出建议
 
         ↓
-⚠️ 确认技术选型：推荐 FastAPI
-(/accept /modify /reject)
+⚠️ 确认技术选型
+  推荐: FastAPI（现代、类型安全、原生异步）
+  备选: Flask（简单、生态成熟）
+
+  (/accept /modify /reject)
 
         ↓
 [代码 Agent] 写 FastAPI hello world
@@ -59,6 +68,8 @@ Lustre Agent 是一个纯 Python 构建的多 Agent 编程助手，采用 Superv
         ↓
 ✅ 完成：代码 + 测试报告
 ```
+
+**核心原则：每个 Agent 执行前都需要你确认，掌控感始终在你手里。**
 
 ---
 
