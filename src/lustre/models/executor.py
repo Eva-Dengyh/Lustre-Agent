@@ -12,9 +12,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from lustre.models.client import ChatMessage, ModelClient
+from lustre.tools.registry import ToolDef
 
 __all__ = ["ReActExecutor", "ToolResult"]
 
@@ -22,9 +23,9 @@ __all__ = ["ReActExecutor", "ToolResult"]
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Tool abstraction
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 @dataclass
 class ToolResult:
@@ -45,21 +46,6 @@ class ToolResult:
             return json.dumps(self.raw, indent=2, ensure_ascii=False)
         except Exception:
             return str(self.raw)
-
-
-ToolFunction = Callable[[dict[str, Any], str | None], Any]
-"""tool_function(args: dict, task_id: str | None) -> Any"""
-
-
-@dataclass
-class ToolDef:
-    """A callable tool available to the ReAct executor."""
-
-    name: str
-    description: str
-    parameters: dict[str, Any]  # JSON Schema
-    function: ToolFunction
-    requires_task_id: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +168,7 @@ class ReActExecutor:
                 else:
                     tool_def = tool_map[tool_name]
                     try:
-                        raw = tool_def.function(arguments, task_id=task_id)
+                        raw = tool_def.invoke(arguments, task_id=task_id)
                         result = ToolResult(tool_name=tool_name, raw=raw)
                     except Exception as exc:  # noqa: BLE001
                         result = ToolResult(
