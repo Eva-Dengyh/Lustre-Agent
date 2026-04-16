@@ -1,27 +1,29 @@
 """Lustre Agent CLI — Interactive shell for multi-agent coordination.
 
-Phase 3: integrates Supervisor + Planner + Specialist agents.
-Demonstrates: user request → plan → confirmation → agent execution → result.
+Phase 4: integrates real LLM-powered CodeAgent via config.
 """
 
 from __future__ import annotations
 
+import os
 import sys
-import threading
-import uuid
-from datetime import datetime
+from pathlib import Path
+
+# Ensure lustre package is importable
+if str(Path(__file__).parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from lustre.agents import SPECIALIST_AGENTS
+from lustre.agents.base import AgentConfig, SpecialistAgent
+from lustre.agents.code_agent import CodeAgent
 from lustre.bus.memory_bus import MemoryMessageBus
-from lustre.bus.message import Message, MessageType
+from lustre.config.loader import load_config
 from lustre.supervisor import (
     ExecutionPlan,
-    Planner,
     Supervisor,
     SupervisorState,
 )
@@ -29,6 +31,7 @@ from lustre.supervisor import (
 console = Console()
 _bus: MemoryMessageBus | None = None
 _supervisor: Supervisor | None = None
+_config = None
 
 
 # ---------------------------------------------------------------------------
@@ -36,9 +39,10 @@ _supervisor: Supervisor | None = None
 # ---------------------------------------------------------------------------
 
 def print_banner() -> None:
+    v = _config.version if _config else "0.4.0"
     banner = Text()
     banner.append("Lustre Agent", style="bold gold1")
-    banner.append("  v0.3.0", style="dim")
+    banner.append(f"  v{v}", style="dim")
     panel = Panel(
         banner,
         title="Multi-Agent CLI Assistant",
@@ -63,10 +67,8 @@ def print_help() -> None:
         ("/retry", "重试失败的上一步"),
         ("/skip", "跳过当前步骤"),
         ("/edit", "修改计划或任务描述"),
-        ("/bg", "挂起任务到后台"),
-        ("/jobs", "列出所有后台任务"),
-        ("/kill <id>", "终止后台任务"),
-        ("/demo", "运行交互演示"),
+        ("/demo", "运行交互演示（Echo 模式，无 LLM）"),
+        ("/llm", "切换到 LLM 模式 CodeAgent"),
     ]
 
     for cmd, desc in commands:
@@ -76,26 +78,65 @@ def print_help() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Supervisor setup
+# Agent factory
+# ---------------------------------------------------------------------------
+
+def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
+    """Create specialist agents, using LLM CodeAgent if API key is available."""
+    cfg = _config
+    agents: dict[str, SpecialistAgent] = {}
+
+    # CodeAgent — use real LLM if ANTHROPIC_API_KEY is set
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key and cfg:
+        code_cfg = cfg.agents.get("code", {})
+        agent_cfg = AgentConfig(
+            name="code",
+            model_provider=code_cfg.get("model_provider", "anthropic"),
+            model_name=code_cfg.get("model_name", "claude-sonnet-4-6"),
+            api_key=api_key,
+        )
+        code_agent = CodeAgent(config=agent_cfg, bus=bus)
+        code_agent.start()
+        agents["code"] = code_agent
+        console.print(f"[dim]CodeAgent (LLM): {agent_cfg.model_name}[/dim]")
+    else:
+        # Fall back to echo
+        from lustre.agents.echo_agent import CodeEchoAgent
+        echo_agent = CodeEchoAgent(bus=bus)
+        echo_agent.start()
+        agents["code"] = echo_agent
+        console.print("[dim]CodeAgent (Echo 模式)[/dim]")
+
+    # ResearchEchoAgent
+    from lustre.agents.echo_agent import EchoAgent
+    research_cfg = AgentConfig(name="research", description="Research agent")
+    research_impl = EchoAgent(config=research_cfg, bus=bus)
+    research_impl.start()
+    agents["research"] = research_impl
+
+    # TestEchoAgent
+    test_cfg = AgentConfig(name="test", description="Test agent")
+    test_impl = EchoAgent(config=test_cfg, bus=bus)
+    test_impl.start()
+    agents["test"] = test_impl
+
+    return agents
+
+
+# ---------------------------------------------------------------------------
+# Supervisor lifecycle
 # ---------------------------------------------------------------------------
 
 def _setup_supervisor() -> Supervisor:
-    """Create and start the supervisor with all registered specialist agents."""
-    global _bus
+    global _bus, _supervisor
 
     if _bus is None:
         _bus = MemoryMessageBus()
 
-    # Instantiate all registered specialist agents
-    agents: dict[str, object] = {}
-    for name, agent_cls in SPECIALIST_AGENTS.items():
-        agent = agent_cls(bus=_bus)
-        agent.start()
-        agents[name] = agent
-
+    agents = _create_agents(_bus)
     sup = Supervisor(bus=_bus, agents=agents)
 
-    # Set up UI callbacks
     def on_confirmation(plan: ExecutionPlan) -> None:
         _print_plan_confirmation(plan)
 
@@ -125,7 +166,6 @@ def _teardown_supervisor() -> None:
 # ---------------------------------------------------------------------------
 
 def _print_plan(plan: ExecutionPlan) -> None:
-    """Print a plan in a formatted table."""
     console.print(f"\n[bold]任务计划 (共 {len(plan.steps)} 步)[/bold]")
     console.print(f"[dim]请求: {plan.original_request}[/dim]\n")
 
@@ -150,7 +190,6 @@ def _print_plan(plan: ExecutionPlan) -> None:
 
 
 def _print_plan_confirmation(plan: ExecutionPlan) -> None:
-    """Print the plan and prompt for confirmation."""
     _print_plan(plan)
     console.print()
     console.print("[bold yellow]⚠️  确认计划[/bold yellow]")
@@ -160,7 +199,6 @@ def _print_plan_confirmation(plan: ExecutionPlan) -> None:
 
 
 def _print_step_complete(step_data: dict) -> None:
-    """Print step completion info."""
     status = step_data.get("status", "?")
     desc = step_data.get("description", "?")
     result = step_data.get("result", "")
@@ -180,19 +218,18 @@ def _print_step_complete(step_data: dict) -> None:
 
     console.print(f"\n{icon} [{status_color}]{status.upper()}[/{status_color}] {desc}")
     if result:
-        for line in result.split("\n")[:5]:
+        for line in result.split("\n")[:8]:
             console.print(f"   {line}")
     if error:
         console.print(f"   [red]错误: {error}[/red]")
 
 
 def _print_task_complete(ctx_data: dict) -> None:
-    """Print final task completion summary."""
     plan = ctx_data.get("plan")
     if not plan:
         return
 
-    console.print("\n[bold gold1]═══════════════════════════════════════[/bold gold1]")
+    console.print("\n[bold gold1]" + "═" * 40 + "[/bold gold1]")
     console.print("[bold green]✅ 任务完成[/bold green]")
 
     table = Table(show_header=True, header_style="bold")
@@ -223,7 +260,6 @@ def _print_task_complete(ctx_data: dict) -> None:
 
 
 def _print_status() -> None:
-    """Print current task status."""
     if _supervisor is None:
         console.print("[dim]Supervisor 未初始化[/dim]")
         return
@@ -250,51 +286,74 @@ def _print_status() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Demo
+# Demo (Echo mode — no real LLM)
 # ---------------------------------------------------------------------------
 
 def run_demo() -> None:
-    """Run an interactive demonstration of the full workflow."""
+    """Run an interactive demonstration using EchoAgents (no LLM needed)."""
     global _supervisor
 
-    console.print("\n[bold]=== Phase 3 交互演示 ===[/bold]\n")
+    console.print("\n[bold]=== Phase 3 交互演示 (Echo 模式) ===[/bold]\n")
 
-    _supervisor = _setup_supervisor()
+    # Use echo agents for demo
+    _bus = MemoryMessageBus()
 
-    # Step 1: submit a task
-    console.print("[cyan]1. 提交任务...[/cyan]")
-    plan = _supervisor.submit(
-        "帮我调研 FastAPI 和 Flask，然后写一个 hello world API"
-    )
-    console.print(f"[green]✓[/green] 计划已生成 ({len(plan.steps)} 步)，等待确认...\n")
+    from lustre.agents.echo_agent import CodeEchoAgent, EchoAgent
+    from lustre.agents.base import AgentConfig
 
-    # Step 2: confirm plan and auto-handle confirmation gates
-    console.print("[cyan]2. 用户确认计划 (simulate /go)...[/cyan]\n")
+    echo_agents: dict[str, SpecialistAgent] = {}
 
-    # Kick off execution (AWAITING_CONFIRMATION → EXECUTING via confirm_plan)
-    _supervisor.confirm_plan()
+    # CodeEchoAgent creates its own config internally
+    code_echo = CodeEchoAgent(bus=_bus)
+    code_echo.start()
+    echo_agents["code"] = code_echo
+
+    # EchoAgent needs explicit config
+    research_cfg = AgentConfig(name="research", description="Research echo agent")
+    research_impl = EchoAgent(config=research_cfg, bus=_bus)
+    research_impl.start()
+    echo_agents["research"] = research_impl
+
+    test_cfg = AgentConfig(name="test", description="Test echo agent")
+    test_impl = EchoAgent(config=test_cfg, bus=_bus)
+    test_impl.start()
+    echo_agents["test"] = test_impl
+
+    sup = Supervisor(bus=_bus, agents=echo_agents)
+
+    def on_confirmation(plan: ExecutionPlan) -> None:
+        _print_plan_confirmation(plan)
+
+    def on_step_complete(step_data: dict) -> None:
+        _print_step_complete(step_data)
+
+    def on_task_complete(ctx_data: dict) -> None:
+        _print_task_complete(ctx_data)
+
+    sup.on_confirmation_needed = on_confirmation
+    sup.on_step_complete = on_step_complete
+    sup.on_task_complete = on_task_complete
+    sup.start()
 
     import time
 
-    states_seen = []
-    for _ in range(60):  # up to 12s
-        state = _supervisor.state
-        if state not in states_seen:
-            states_seen.append(state)
-            console.print(f"[dim]  state changed to: {state.value}[/dim]")
-        time.sleep(0.2)
+    plan = sup.submit("调研 FastAPI 和 Flask，然后写一个 hello world API")
+    console.print(f"[green]✓[/green] 计划已生成 ({len(plan.steps)} 步)\n")
 
+    sup.confirm_plan()
+
+    for _ in range(60):
+        state = sup.state
+        time.sleep(0.2)
         if state == SupervisorState.DONE:
             break
         if state == SupervisorState.ABORTED:
             break
-
         if state == SupervisorState.AWAITING_CONFIRMATION:
-            _supervisor.confirm_and_continue()
+            sup.confirm_and_continue()
 
+    sup.stop()
     console.print("\n[bold]=== 演示结束 ===[/bold]\n")
-
-    _teardown_supervisor()
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +361,22 @@ def run_demo() -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _supervisor, _bus
+    global _supervisor, _config
+
+    # Load config first
+    try:
+        _config = load_config()
+    except FileNotFoundError:
+        console.print("[yellow]警告: 未找到配置文件，使用默认配置[/yellow]")
+        _config = None
 
     print_banner()
+    console.print("[dim]输入 /help 查看命令[/dim]\n")
 
-    # Initialise bus and supervisor for this session
+    # Initialise bus and supervisor
     _bus = MemoryMessageBus()
     _supervisor = _setup_supervisor()
-
-    console.print("[dim][supervisor][/dim] Supervisor 就绪", style="green")
-    console.print("[dim]输入 /help 查看命令，输入 /exit 退出[/dim]\n")
+    console.print("[green]✓[/green] Supervisor 就绪\n")
 
     while True:
         try:
@@ -341,8 +406,7 @@ def main() -> None:
             _print_status()
 
         elif cmd == "/new":
-            console.print("[dim]请直接输入你的需求（相当于 /new）[/dim]")
-            console.print("[dim]例如: 帮我写一个 FastAPI hello world[/dim]")
+            console.print("[dim]请直接输入你的需求[/dim]")
 
         elif cmd == "/go":
             if _supervisor and _supervisor.state == SupervisorState.AWAITING_CONFIRMATION:
@@ -355,9 +419,6 @@ def main() -> None:
             if _supervisor:
                 _supervisor.request_abort()
                 console.print("[yellow]任务已取消[/yellow]")
-                _teardown_supervisor()
-                _bus = MemoryMessageBus()
-                _supervisor = _setup_supervisor()
 
         elif cmd == "/retry":
             if _supervisor:
@@ -370,11 +431,19 @@ def main() -> None:
         elif cmd == "/edit":
             console.print("[dim]功能开发中 (Phase 5+)[/dim]")
 
-        elif cmd in ("/bg", "/jobs", "/kill"):
-            console.print("[dim]功能开发中 (Phase 5+)[/dim]")
+        elif cmd == "/llm":
+            # Reload with LLM agents
+            _teardown_supervisor()
+            if _config is None:
+                try:
+                    _config = load_config()
+                except FileNotFoundError:
+                    console.print("[red]无法加载配置[/red]")
+            _bus = MemoryMessageBus()
+            _supervisor = _setup_supervisor()
+            console.print("[green]已切换到 LLM 模式[/green]")
 
         elif not cmd.startswith("/"):
-            # Free-text input treated as a new task request
             if _supervisor and _supervisor.state == SupervisorState.IDLE:
                 try:
                     plan = _supervisor.submit(cmd)
@@ -382,9 +451,7 @@ def main() -> None:
                 except Exception as exc:
                     console.print(f"[red]错误: {exc}[/red]")
             else:
-                console.print(
-                    "[dim]当前有任务进行中，请先 /abort 后再提交新任务[/dim]"
-                )
+                console.print("[dim]当前有任务进行中，请先 /abort 后再提交新任务[/dim]")
 
         else:
             console.print(f"[red]未知命令: {cmd}[/red]")
