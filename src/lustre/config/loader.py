@@ -118,6 +118,22 @@ class Config:
     def version(self) -> str:
         return self.system.get("version", "0.0.0")
 
+    def create_bus(self) -> "MessageBus":
+        """Create a MessageBus from the message_bus config.
+
+        Default: MemoryMessageBus. Set type=redis in config.yaml to use Redis.
+
+        Example config.yaml:
+            message_bus:
+              type: redis
+              url: redis://localhost:6379/0
+        """
+        from lustre.bus import create_message_bus
+        bus_type = self.message_bus.get("type", "memory")
+        url = self.message_bus.get("url")
+        kwargs = {"url": url} if url else {}
+        return create_message_bus(bus_type=bus_type, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton
