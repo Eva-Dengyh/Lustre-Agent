@@ -174,7 +174,7 @@ ReActExecutor 实现于 `lustre/models/executor.py`，所有 SpecialistAgent 共
 | **测试** | pytest | 52 个单元测试全部通过 |
 | **CLI 美化** | Rich | 富文本输出、表格、面板、语法高亮 |
 | **配置** | YAML + pydantic | YAML 人类可编辑，pydantic 校验类型 |
-| **LLM 调用** | openai SDK + anthropic SDK | Provider 统一抽象 |
+| **LLM 调用** | openai SDK + anthropic SDK + MiniMaxClient + ClaudeCodeClient | Provider 统一抽象，支持 API / CLI / subprocess |
 | **会话存储** | SQLite | 零配置，同步接口，FTS5 全文搜索 |
 | **消息总线** | MemoryMessageBus / RedisMessageBus | 通过 `create_message_bus()` 一键切换 |
 
@@ -220,10 +220,13 @@ lustre-agent/
 │   │   │   ├── redis_bus.py       # Redis Streams 实现（Phase 9）
 │   │   │   └── message.py         # Message / MessageType 数据类
 │   │   │
-│   │   ├── models/                # LLM 层
-│   │   │   ├── __init__.py
-│   │   │   ├── client.py          # LLMClient 工厂（Anthropic/OpenAI）
-│   │   │   └── executor.py        # ReActExecutor（Phase 4）
+│   ├── models/                # LLM 层
+│   │   ├── __init__.py
+│   │   ├── client.py          # LLMClient 工厂 + 4个客户端实现
+│   │   │                      #   AnthropicClient / OpenAIClient
+│   │   │                      #   MiniMaxClient (OpenAI-compatible)
+│   │   │                      #   ClaudeCodeClient (subprocess ACP)
+│   │   └── executor.py        # ReActExecutor（Phase 4）
 │   │   │
 │   │   ├── agents/                # Agent 层
 │   │   │   ├── __init__.py
@@ -367,7 +370,52 @@ addopts = "-v --tb=short"
 
 ## 4. 核心模块详解
 
-### 4.1 消息总线（bus/）
+### 4.0 模型层（models/）
+
+```
+models/
+├── client.py      # 4个 ModelClient 实现 + create_client() 工厂
+└── executor.py    # ReActExecutor
+```
+
+**4个 Provider 客户端：**
+
+| Client | 协议 | API Key 环境变量 | 用途 |
+|--------|------|-----------------|------|
+| `AnthropicClient` | Anthropic SDK / HTTPS | `ANTHROPIC_API_KEY` | Claude Sonnet/Haiku |
+| `OpenAIClient` | OpenAI SDK / HTTPS | `OPENAI_API_KEY` | GPT-4o / o1 / o3 |
+| `MiniMaxClient` | OpenAI-compatible / HTTPS | `MINIMAX_API_KEY` | MiniMax-Text-01 等 |
+| `ClaudeCodeClient` | ACP subprocess / stdio | `ANTHROPIC_API_KEY` | Claude Code CLI 工具 |
+
+**工厂用法：**
+```python
+from lustre.models.client import create_client
+
+# API 方式
+client = create_client("anthropic")
+client = create_client("openai")
+client = create_client("minimax", base_url="https://api.minimax.chat/v1", model="MiniMax-Text-01")
+
+# CLI 方式（Claude Code）
+client = ClaudeCodeClient(claude_path="claude", model="claude-sonnet-4-6")
+```
+
+**统一响应格式（所有 Client 返回相同结构）：**
+```python
+{
+    "content": "...",          # 文本回复
+    "tool_calls": [...],       # 工具调用列表
+    "stop_reason": "...",      # 停止原因
+    "usage": {"input_tokens": N, "output_tokens": N, "total_tokens": N}
+}
+```
+
+**ClaudeCodeClient 特别说明：**
+- 启动 `claude --acp --stdio` 子进程，通过 JSON over stdio 通信
+- 后台读线程持续监听子进程输出，`pending` dict 匹配 `request_id`
+- 适合作为 Lustre Supervisor 下的 sub-agent，让 Claude Code 处理完整的 ReAct 循环
+
+### 4.2 消息总线（bus/）
 
 ```
 bus/
@@ -392,7 +440,7 @@ lustre:stream:<topic>   — 消息流（如 lustre:stream:task.code）
 lustre:reply:<msg_id>  — 临时回复流（request/response 用）
 ```
 
-### 4.2 工具系统（tools/）
+### 4.3 工具系统（tools/）
 
 ```
 tools/
@@ -434,7 +482,7 @@ def read_file(path: str, offset: int = 1, limit: int = 500, task_id=None):
  "test": ["read_file", "search_files", "terminal"]}
 ```
 
-### 4.3 Skill 系统（skills/）
+### 4.4 Skill 系统（skills/）
 
 ```
 skills/
@@ -466,7 +514,7 @@ keywords: [python, pep8, typing, docstring]
 
 **匹配算法：** keyword 精确匹配（score × 1.0）+ TF-IDF cosine similarity（score × 2.0）
 
-### 4.4 Session 系统（session/）
+### 4.5 Session 系统（session/）
 
 ```
 session/
