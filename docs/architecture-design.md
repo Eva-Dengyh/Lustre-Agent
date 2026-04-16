@@ -7,6 +7,147 @@
 
 ---
 
+---
+
+## 0. 开发前必读：Agent 核心概念
+
+> 每次开始实现新功能前，请先阅读本节。它解释了我们为什么这样设计，以及每个设计决策背后的逻辑。
+
+### 0.1 核心公式
+
+```
+Agent = Model + Harness
+```
+
+**如果你不是模型，那你就是在做 Harness 工程。**
+
+这句话来自 LangChain 的博客《The Anatomy of an Agent Harness》，是理解整个项目的第一性原理。
+
+- **Model（模型）**：纯粹的推理引擎。给它文字，它输出文字。它不知道文件在哪，不会执行代码，不能持久化状态，不能搜索最新信息。
+- **Harness（笼/马具）**：模型之外的所有代码、配置、执行逻辑。把模型变成可用系统的所有工程部分。
+
+Raw model ≠ Agent。Harness 给了它：状态、工具执行、反馈循环、可执行的约束。
+
+### 0.2 模型做不到的事（需要 Harness 来补）
+
+| 模型"做不到"的事 | Harness 如何解决 |
+|-----------------|-----------------|
+| 不能持久化状态 | 会话存储（SQLite SessionStore） |
+| 不能执行代码 | 工具系统（terminal / code execution） |
+| 不能获取实时信息 | 工具（web_search） |
+| 不能操作文件系统 | 工具（read_file / write_file / patch） |
+| 不能并行处理多任务 | 消息总线 + 多 Agent 架构 |
+| 不能自己验证结果 | 测试 Agent（Test Agent 运行测试） |
+| 不能在长任务中保持方向 | Supervisor 协调 + 人工确认门 |
+
+### 0.3 Lustre Agent 的 Harness 映射
+
+我们在项目中每个模块对应的 Harness 角色：
+
+| Harness 组件 | 对应项目模块 | Phase |
+|--------------|------------|-------|
+| **System Prompts** | `prompts/*.md` | Phase 4 |
+| **Tools（工具描述）** | `lustre/tools/` + `prompts/*.md` | Phase 4 |
+| **Bundled Infrastructure** | `lustre/bus/`（消息总线）、文件系统工具 | Phase 1 |
+| **Orchestration Logic** | `lustre/supervisor/`（状态机、任务分配） | Phase 3 |
+| **Hooks / Middleware** | `lustre/plugins/`（插件系统） | Phase 10 |
+| **Durable Storage** | `lustre/session/`（SQLite） | Phase 8 |
+| **Human-in-the-loop** | `lustre/supervisor/human_in_loop.py` | Phase 5 |
+
+### 0.4 设计的核心原则
+
+#### 原则 1：人机协同优先
+
+模型会出错、会跑偏方向。我们把"人工确认"做成框架级约束，而不是可选项。
+
+- Supervisor 在每个 Agent 执行前暂停，等用户说 `/go`
+- 调研结果出来后问用户 `/accept`
+- 代码完成后（可选）问用户是否满意再测试
+
+这不是功能，是**设计哲学**。掌控感始终在用户手里。
+
+#### 原则 2：Harness 要尽量薄
+
+Harness 是手段，不是目的。Harness 的职责是**让模型做有用的事**，而不是替代模型思考。
+
+体现：
+- Supervisor 只做协调（理解任务 → 拆解 → 分配 → 聚合），不写代码
+- 专业 Agent 拿到任务后自主决定怎么做
+- 工具系统给模型提供能力，不强制模型用特定方式工作
+
+#### 原则 3：确定性逻辑在 Harness，推理在 Model
+
+模型擅长推理，但不可靠。确定性逻辑（流程控制、状态机、错误处理）必须在 Harness 层处理。
+
+反例：让模型自己决定是否需要重试。→ 模型会过度思考。
+正确做法：Harness 定义重试策略（超过 N 次失败 → 询问用户）。
+
+#### 原则 4：先让单 Agent 跑通，再扩展多 Agent
+
+Phase 4 先让 Code Agent 单独跑通（接收任务 → 调用 LLM → 使用工具 → 返回结果）。
+Phase 5 才加入 Supervisor 和多 Agent 协调。
+
+过早引入复杂性会拖慢迭代速度。
+
+#### 原则 5：消息总线是最底层依赖
+
+所有 Agent 之间、Agent 与 Supervisor 之间的通信，都经过消息总线。
+
+这不是过度设计，而是为未来留出扩展空间：
+- 当前：MemoryMessageBus（进程内，调试方便）
+- 未来：RedisMessageBus（分布式，多进程）
+- 切换方式：改一行配置
+
+### 0.5 Agent 协作模式
+
+Lustre Agent 采用 **Supervisor 模式**，选择一个还是多个 Specialist 取决于任务复杂度。
+
+```
+┌─────────────────────────────────────────┐
+│  Supervisor                             │
+│  • 理解用户意图                         │
+│  • 拆解任务                             │
+│  • 选择 Agent                           │
+│  • 分配任务                             │
+│  • 聚合结果                             │
+└─────────────────────────────────────────┘
+```
+
+为什么选这个模式：
+- 单一入口，用户体验简单（只跟 Supervisor 说话）
+- Supervisor 可以统筹全局（知道所有 Agent 在做什么）
+- 比流水线模式（Pipeline）更灵活，Agent 之间可以有条件跳转
+
+### 0.6 ReAct 循环
+
+Agent 的核心执行循环是 **ReAct**（Reason + Act + Observe）：
+
+```
+while 未完成:
+    1. Reason（推理）  →  LLM 分析当前状态，决定下一步
+    2. Act（行动）     →  LLM 调用工具（读文件、搜索、运行命令）
+    3. Observe（观察） →  工具返回结果
+    4. Loop           →  结果注入上下文，LLM 继续推理
+```
+
+这是 Lustre Agent 所有 Agent 的底层执行逻辑，Phase 4 开始实现。
+
+### 0.7 术语表
+
+| 术语 | 含义 |
+|------|------|
+| **Harness** | 模型之外的所有工程代码和配置 |
+| **Model** | LLM（大语言模型），纯粹推理引擎 |
+| **Agent** | Model + Harness = 可工作的智能体 |
+| **Supervisor** | 协调 Agent，理解需求、拆解任务、分配工作 |
+| **Specialist** | 专业 Agent（如 Code Agent），执行具体任务 |
+| **ReAct** | 推理→行动→观察→循环的执行模式 |
+| **Human-in-the-loop** | 人工确认介入，掌控关键决策节点 |
+| **Message Bus** | Agent 间通信通道，本项目是消息总线的实现 |
+| **Skill** | 可加载的 prompt 模板 + 脚本，增强 Agent 能力 |
+
+---
+
 ## 1. 概述
 
 ### 1.1 项目定位
