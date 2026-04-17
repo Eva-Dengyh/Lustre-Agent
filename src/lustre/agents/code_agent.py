@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from lustre.agents.base import AgentConfig, SpecialistAgent
 from lustre.bus.message import TaskRequest, TaskResult
-from lustre.models.client import ChatMessage, create_client
+from lustre.models.client import ChatMessage, create_client, resolve_api_key
 from lustre.models.executor import ReActExecutor
 from lustre.tools.builtin import get_builtin_tools
 
@@ -78,7 +78,7 @@ class CodeAgent(SpecialistAgent):
 
         # Build LLM client from config
         provider = config.model_provider or "anthropic"
-        api_key = config.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        api_key = resolve_api_key(provider, config.api_key)
         self._client = create_client(provider, api_key=api_key)
         self._model = config.model_name or "claude-sonnet-4-6"
 

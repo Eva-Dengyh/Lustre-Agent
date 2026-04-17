@@ -7,11 +7,54 @@ Phase 5+ will add DeepSeek, Gemini, etc.
 from __future__ import annotations
 
 import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-__all__ = ["ModelClient", "AnthropicClient", "OpenAIClient", "MiniMaxClient", "ClaudeCodeClient", "ChatMessage"]
+__all__ = [
+    "ModelClient",
+    "AnthropicClient",
+    "OpenAIClient",
+    "MiniMaxClient",
+    "ClaudeCodeClient",
+    "ChatMessage",
+    "get_provider_api_key_env",
+    "resolve_api_key",
+]
+
+
+_PROVIDER_API_KEY_ENV: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+}
+
+_ENV_PLACEHOLDER_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}$")
+
+
+def get_provider_api_key_env(provider: str | None) -> str | None:
+    """Return the default API key environment variable for a provider."""
+    if not provider:
+        return None
+    return _PROVIDER_API_KEY_ENV.get(provider)
+
+
+def resolve_api_key(provider: str | None, api_key: str | None = None) -> str:
+    """Resolve an API key from an explicit value or provider-specific env var."""
+    if api_key:
+        match = _ENV_PLACEHOLDER_PATTERN.match(api_key)
+        if match:
+            env_var = match.group(1)
+            default = match.group(2)
+            return os.environ.get(env_var, default or "")
+        return api_key
+
+    env_var = get_provider_api_key_env(provider)
+    if not env_var:
+        return ""
+
+    return os.environ.get(env_var, "")
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +602,7 @@ class ClaudeCodeClient(ModelClient):
 # ---------------------------------------------------------------------------
 
 def create_client(
-    provider: Literal["anthropic", "openai", "minimax"],
+    provider: Literal["anthropic", "openai", "minimax", "custom"],
     api_key: str | None = None,
     **kwargs: Any,
 ) -> ModelClient:
@@ -568,6 +611,6 @@ def create_client(
         return AnthropicClient(api_key=api_key)
     if provider == "openai":
         return OpenAIClient(api_key=api_key)
-    if provider == "minimax":
+    if provider in ("minimax", "custom"):
         return MiniMaxClient(api_key=api_key, **kwargs)
     raise ValueError(f"Unknown provider: {provider!r}")

@@ -22,6 +22,7 @@ from lustre.agents.base import AgentConfig, SpecialistAgent
 from lustre.agents.code_agent import CodeAgent
 from lustre.bus.memory_bus import MemoryMessageBus
 from lustre.config.loader import load_config
+from lustre.models.client import ChatMessage, create_client, resolve_api_key
 from lustre.session import SessionManager
 from lustre.skills import SkillManager
 from lustre.skills.models import SkillInstance
@@ -37,6 +38,8 @@ _supervisor: Supervisor | None = None
 _config = None
 _skill_manager: SkillManager | None = None
 _session_manager: SessionManager | None = None
+_llm_client: "ModelClient | None" = None  # lazy LLM client for direct chat
+_llm_model: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -65,12 +68,7 @@ def print_help() -> None:
     commands = [
         ("/help", "显示本帮助信息"),
         ("/exit", "退出 CLI"),
-        ("/new", "开始新任务（输入需求）"),
-        ("/status", "查看当前任务状态"),
-        ("/go", "通过当前确认门，继续执行"),
-        ("/abort", "取消当前任务"),
-        ("/retry", "重试失败的上一步"),
-        ("/skip", "跳过当前步骤"),
+        ("/code <任务>", "进入编码模式（任务拆解 + Agent 执行）"),
         ("/skills", "查看已加载的 Skills"),
         ("/skills load <name>", "加载指定 Skill"),
         ("/skills unload <name>", "卸载指定 Skill"),
@@ -80,6 +78,9 @@ def print_help() -> None:
         ("/sessions search <关键词>", "搜索会话内容"),
         ("/config", "查看当前配置"),
         ("/config edit", "在编辑器中修改配置"),
+        ("/status", "查看当前任务状态"),
+        ("/go", "通过确认门，继续执行计划"),
+        ("/abort", "取消当前任务"),
         ("/demo", "运行交互演示（Echo 模式，无 LLM）"),
     ]
 
@@ -121,13 +122,19 @@ def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
     sm = _skill_manager
     agents: dict[str, SpecialistAgent] = {}
 
-    # CodeAgent — use real LLM if ANTHROPIC_API_KEY is set
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key and cfg:
+    # CodeAgent — use real LLM if the configured provider has a valid API key
+    if cfg:
         code_cfg = cfg.agents.get("code", {})
+        provider = code_cfg.get("model_provider", "anthropic")
+        api_key = resolve_api_key(provider, code_cfg.get("api_key"))
+    else:
+        provider = "anthropic"
+        api_key = ""
+
+    if api_key and cfg:
         agent_cfg = AgentConfig(
             name="code",
-            model_provider=code_cfg.get("model_provider", "anthropic"),
+            model_provider=provider,
             model_name=code_cfg.get("model_name", "claude-sonnet-4-6"),
             api_key=api_key,
         )
@@ -140,12 +147,11 @@ def _create_agents(bus: MemoryMessageBus) -> dict[str, SpecialistAgent]:
         agents["code"] = code_agent
         console.print(f"[dim]CodeAgent (LLM): {agent_cfg.model_name}[/dim]")
     else:
-        # Fall back to echo
+        console.print("[dim]CodeAgent (Echo 模式 — 无 API Key)[/dim]")
         from lustre.agents.echo_agent import CodeEchoAgent
         echo_agent = CodeEchoAgent(bus=bus)
         echo_agent.start()
         agents["code"] = echo_agent
-        console.print("[dim]CodeAgent (Echo 模式)[/dim]")
 
     # Echo agents for research/test
     from lustre.agents.echo_agent import EchoAgent
@@ -586,13 +592,16 @@ def _reload_code_agent() -> None:
 
 def _create_code_agent_with_skills() -> SpecialistAgent | None:
     """Create a new CodeAgent with the current skill set."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key or not _config:
+    if not _config:
         return None
     code_cfg = _config.agents.get("code", {})
+    provider = code_cfg.get("model_provider", "anthropic")
+    api_key = resolve_api_key(provider, code_cfg.get("api_key"))
+    if not api_key:
+        return None
     agent_cfg = AgentConfig(
         name="code",
-        model_provider=code_cfg.get("model_provider", "anthropic"),
+        model_provider=provider,
         model_name=code_cfg.get("model_name", "claude-sonnet-4-6"),
         api_key=api_key,
     )
@@ -600,6 +609,78 @@ def _create_code_agent_with_skills() -> SpecialistAgent | None:
     code_agent = CodeAgent(config=agent_cfg, bus=_bus, skills=skills)
     code_agent.start()
     return code_agent
+
+
+# ---------------------------------------------------------------------------
+# Direct LLM chat (default mode)
+# ---------------------------------------------------------------------------
+
+def _get_llm_client():
+    """Lazily create the global LLM client from config."""
+    global _llm_client, _llm_model
+    if _llm_client is not None:
+        return _llm_client
+
+    if _config is None:
+        return None
+
+    model_cfg = _config.get("model") or {}
+    provider = model_cfg.get("provider", "")
+    model_name = model_cfg.get("model", "")
+    api_key = model_cfg.get("api_key", "")
+
+    if not provider or not model_name:
+        return None
+
+    # Resolve env var placeholder
+    if isinstance(api_key, str) and api_key.startswith("${") and api_key.endswith("}"):
+        env_var = api_key[2:-1]
+        api_key = os.environ.get(env_var, "")
+
+    base_url = model_cfg.get("base_url")
+    extra: dict = {}
+    if base_url:
+        extra["base_url"] = base_url
+
+    try:
+        _llm_client = create_client(provider, api_key=api_key, **extra)
+        _llm_model = model_name
+        return _llm_client
+    except Exception as exc:
+        console.print(f"[red]LLM 初始化失败: {exc}[/red]")
+        return None
+
+
+def _chat_direct(user_message: str) -> None:
+    """Send a message directly to the LLM, print the response.
+
+    Used for casual chat when not in code mode.
+    """
+    client = _get_llm_client()
+    if client is None:
+        console.print("[yellow]LLM 未配置。请先 /config edit 或输入 /code 切换到编码模式[/yellow]")
+        return
+
+    messages = [
+        ChatMessage(role="user", content=user_message),
+    ]
+
+    try:
+        with console.status("[cyan]思考中...[/cyan]", spinner="dots"):
+            response = client.chat(messages, model=_llm_model or undefined)
+    except Exception as exc:
+        console.print(f"[red]调用 LLM 出错: {exc}[/red]")
+        return
+
+    content = response.get("content", "")
+    if content:
+        console.print(f"\n{content}\n")
+    tool_calls = response.get("tool_calls", [])
+    if tool_calls:
+        console.print(f"[dim]（工具调用 {len(tool_calls)} 次，略）[/dim]")
+
+
+undefined = "UNDEFINED_MODEL"  # sentinel
 
 
 # ---------------------------------------------------------------------------
@@ -798,15 +879,27 @@ def main() -> None:
         elif cmd == "/edit":
             console.print("[dim]功能开发中 (Phase 6+)[/dim]")
 
-        elif not cmd.startswith("/"):
-            if _supervisor and _supervisor.state == SupervisorState.IDLE:
-                try:
-                    plan = _supervisor.submit(cmd)
-                    _print_plan_confirmation(plan)
-                except Exception as exc:
-                    console.print(f"[red]错误: {exc}[/red]")
+        elif cmd.startswith("/code"):
+            # Enter code mode — submit to supervisor
+            code_task = cmd[len("/code"):].strip()
+            if _supervisor is None:
+                console.print("[yellow]Supervisor 未初始化[/yellow]")
+            elif _supervisor.state != SupervisorState.IDLE:
+                console.print("[yellow]当前有任务进行中，请先 /abort[/yellow]")
             else:
-                console.print("[dim]当前有任务进行中，请先 /abort 后再提交新任务[/dim]")
+                if code_task:
+                    try:
+                        plan = _supervisor.submit(code_task)
+                        _print_plan_confirmation(plan)
+                    except Exception as exc:
+                        console.print(f"[red]错误: {exc}[/red]")
+                else:
+                    console.print("[dim]已进入编码模式，输入任务描述后会自动生成计划[/dim]")
+                    console.print("[dim]输入 /abort 退出编码模式[/dim]")
+
+        elif not cmd.startswith("/"):
+            # Default: direct LLM chat
+            _chat_direct(cmd)
 
         else:
             console.print(f"[red]未知命令: {cmd}[/red]")

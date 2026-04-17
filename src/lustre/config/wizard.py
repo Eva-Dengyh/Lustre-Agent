@@ -60,6 +60,13 @@ _PROVIDERS = {
         ],
     },
     "4": {
+        "name": "自定义中转站 (OpenAI 兼容格式)",
+        "key_env": "",
+        "key_example": "",
+        "default_model": "",
+        "models": [],
+    },
+    "5": {
         "name": "本地模型 / Other (手动配置)",
         "key_env": "",
         "key_example": "",
@@ -103,9 +110,9 @@ def run_wizard() -> dict:
 
     console.print()
     choice = Prompt.ask(
-        "请选择 [1-4]",
+        "请选择 [1-5]",
         default="1",
-        choices=["1", "2", "3", "4"],
+        choices=["1", "2", "3", "4", "5"],
         show_default=True,
     )
     prov = _PROVIDERS[choice]
@@ -115,7 +122,16 @@ def run_wizard() -> dict:
 
     # Step 2: Enter API key (unless "other")
     api_key = ""
-    if prov["key_env"]:
+    custom_base_url = ""
+    if choice == "4":
+        console.print()
+        console.print("[bold]步骤 2/4 — 配置自定义中转站[/bold]")
+        console.print()
+        custom_base_url = Prompt.ask("中转站 Base URL（如 https://api.example.com/v1）").strip()
+        raw_key = getpass("API Key: ")
+        api_key = raw_key.strip()
+        console.print(f"[green]✓[/green] 中转站已配置")
+    elif prov["key_env"]:
         console.print()
         console.print("[bold]步骤 2/4 — 输入 API Key[/bold]")
         console.print(f"  环境变量 [dim]{prov['key_env']}[/dim] 如果已设置则直接回车跳过")
@@ -138,6 +154,7 @@ def run_wizard() -> dict:
 
     # Step 3: Choose model
     default_model = prov["default_model"]
+    base_url = custom_base_url  # may be set by custom provider
     if prov["models"]:
         console.print()
         console.print("[bold]步骤 3/4 — 选择模型[/bold]")
@@ -156,17 +173,20 @@ def run_wizard() -> dict:
         model_name = prov["models"][model_idx][0]
         console.print(f"[green]✓[/green] 已选择: {model_name}")
 
-        base_url = ""
-        if choice == "3":
+        if choice == "3" and not base_url:
             base_url = "https://api.minimax.chat/v1"
             console.print(f"  [dim]Base URL: {base_url}[/dim]")
     else:
         console.print()
         console.print("[bold]步骤 3/4 — 输入模型名称[/bold]")
-        console.print("  请手动输入你要使用的模型名称（如 openai/gpt-4o）")
+        if choice == "4":
+            console.print(f"  [dim]中转站: {base_url}[/dim]")
+        else:
+            console.print("  请手动输入你要使用的模型名称（如 gpt-4o）")
         console.print()
         model_name = Prompt.ask("模型名称").strip()
-        base_url = Prompt.ask("Base URL（可选，回车跳过）").strip()
+        if not base_url:
+            base_url = Prompt.ask("Base URL（可选，回车跳过）").strip()
         console.print(f"[green]✓[/green] 已记录: {model_name}")
 
     # Step 4: Review
@@ -181,6 +201,8 @@ def run_wizard() -> dict:
         provider_key = "openai"
     elif choice == "3":
         provider_key = "minimax"
+    elif choice == "4":
+        provider_key = "custom"
     else:
         provider_key = "openai"  # fallback
 
@@ -190,13 +212,13 @@ def run_wizard() -> dict:
         "model": {
             "provider": provider_key,
             "model": model_name,
-            "api_key": api_key or f"${{{prov['key_env']}}}",
+            "api_key": api_key or (f"${{{prov['key_env']}}}" if prov["key_env"] else ""),
         },
         "agents": {
             "code": {
                 "model_provider": provider_key,
                 "model_name": model_name,
-                "api_key": api_key or f"${{{prov['key_env']}}}",
+                "api_key": api_key or (f"${{{prov['key_env']}}}" if prov["key_env"] else ""),
             },
         },
         "tools": {
