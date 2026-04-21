@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ───── Lustre-Agent 项目 ─────
+# 运行时会话持久化
+.lustre/
+*.sqlite
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
