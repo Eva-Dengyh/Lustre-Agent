@@ -63,12 +63,15 @@ def _chat_repl():
             console.print(f"[dim]New thread: {thread_id[:8]}[/dim]")
         else:
             config = {"configurable": {"thread_id": thread_id}}
-            result = graph.invoke(
-                {"messages": [HumanMessage(content=user_input)]},
-                config=config,
-            )
-            ai_msg = result["messages"][-1]
-            console.print(Markdown(ai_msg.content))
+            try:
+                result = graph.invoke(
+                    {"messages": [HumanMessage(content=user_input)]},
+                    config=config,
+                )
+                ai_msg = result["messages"][-1]
+                console.print(Markdown(ai_msg.content))
+            except Exception as e:
+                console.print(f"[bold red]Error:[/bold red] {e}")
 
 
 def _print_thread(graph, thread_id: str):

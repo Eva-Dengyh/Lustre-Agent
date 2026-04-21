@@ -1,7 +1,7 @@
 ---
 day: 3
 title: "Tool Use —— 让 Agent 动手"
-status: draft
+status: done
 est_minutes: 120
 depends_on: [day2]
 ---
@@ -142,3 +142,102 @@ uv run pytest tests/day3_smoke.py -v
 - **今日核心**：工具抽象 + 条件边循环；让 agent 真正能干活
 - **你现在可以**：让聊天 agent 做本地小任务
 - **明日（Day 4）预告**：加 Planner，把 `/code <需求>` 变成结构化任务计划
+
+---
+
+## 9. 实际实现记录
+
+### 9.1 文件结构
+
+```
+src/lustre_agent/
+├── tools/
+│   ├── __init__.py       新增：汇总 ALL_TOOLS 列表
+│   ├── fs.py             新增：read_file / write_file / list_dir
+│   └── shell.py          新增：run_shell 带白名单
+├── agents/
+│   └── chat.py           修改：make_chat_node 内改用 llm.bind_tools(ALL_TOOLS)
+├── graph.py              修改：加 ToolNode 节点 + tools_condition 条件边
+tests/
+└── day3_smoke.py         新增：10 个测试（单元 + graph 集成）
+```
+
+### 9.2 关键实现细节
+
+**`tools/fs.py` — 路径安全**
+
+用 `Path.resolve()` 验证路径不越界到项目根目录之外：
+
+```python
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+def _resolve(path: str) -> Path:
+    resolved = (_PROJECT_ROOT / path).resolve()
+    if not str(resolved).startswith(str(_PROJECT_ROOT)):
+        raise ValueError(f"Path {path!r} escapes project root")
+    return resolved
+```
+
+三个工具都经过 `_resolve()` 检查，`write_file` 额外调用 `mkdir(parents=True, exist_ok=True)` 自动创建父目录。
+
+**`tools/shell.py` — 白名单沙箱**
+
+用 `shlex.split` 解析命令，取 `parts[0]` 与白名单对比，不在白名单直接返回 dict 而不抛异常，让 agent 能感知并处理失败：
+
+```python
+WHITELIST = {"python", "pytest", "uv", "ls", "cat", "pwd", "grep", "find"}
+
+if executable not in WHITELIST:
+    return {"returncode": -1, "stdout": "", "stderr": f"denied: '{executable}' is not in the allowed command whitelist"}
+```
+
+**`agents/chat.py` — bind_tools**
+
+`make_chat_node` 改为每次调用时执行 `bind_tools`，保持 llm 可替换（测试时注入 fake LLM）：
+
+```python
+def chat_node(state) -> dict:
+    _llm = llm or get_llm()
+    llm_with_tools = _llm.bind_tools(ALL_TOOLS)
+    response = llm_with_tools.invoke([system] + list(state["messages"]))
+    return {"messages": [response]}
+```
+
+**`graph.py` — 条件循环**
+
+用 LangGraph 内置的 `tools_condition` 判断最新 AIMessage 是否含 `tool_calls`：
+
+```python
+from langgraph.prebuilt import ToolNode, tools_condition
+
+g.add_node("tools", ToolNode(ALL_TOOLS))
+g.add_conditional_edges("chat", tools_condition, {"tools": "tools", END: END})
+g.add_edge("tools", "chat")
+```
+
+形成 `chat → (有 tool_calls?) → tools → chat → ... → END` 的循环。
+
+### 9.3 测试策略
+
+smoke test 里的 fake LLM 通过 `_call_count` 控制行为：
+- 第 1 次 `invoke` 返回带 `tool_calls` 的 AIMessage（触发工具执行）
+- 第 2 次 `invoke` 返回普通文本（结束循环）
+
+fake LLM 实现了 `bind_tools(self)` 返回 `self`，保证注入路径与真实 LLM 一致。
+
+### 9.4 验收结果
+
+```
+tests/day3_smoke.py::test_write_and_read_file               PASSED
+tests/day3_smoke.py::test_read_missing_file                 PASSED
+tests/day3_smoke.py::test_list_dir                          PASSED
+tests/day3_smoke.py::test_run_shell_whitelist_denied        PASSED
+tests/day3_smoke.py::test_run_shell_whitelist_allowed       PASSED
+tests/day3_smoke.py::test_run_shell_dangerous_commands_denied PASSED
+tests/day3_smoke.py::test_all_tools_registered              PASSED
+tests/day3_smoke.py::test_tool_schemas_valid                PASSED
+tests/day3_smoke.py::test_graph_calls_write_file_tool       PASSED
+tests/day3_smoke.py::test_graph_denies_non_whitelisted_shell PASSED
+
+10 passed in 0.38s
+```
